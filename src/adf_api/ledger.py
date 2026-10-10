@@ -550,6 +550,50 @@ def control(
     return {"command_id": command.id, "run_id": run.id, "requested": action}
 
 
+def cancel_nodes(session: Session, run: Run, executions: list[Execution]) -> None:
+    """Close interrupted node attempts after execution drain in the run transaction."""
+    by_id = {execution.id: execution for execution in executions}
+    nodes = session.scalars(
+        select(Node)
+        .where(
+            Node.run_id == run.id,
+            Node.status.not_in({"succeeded", "failed", "cancelled", "skipped"}),
+        )
+        .order_by(Node.node_id, Node.attempt)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    for node in nodes:
+        reference = node.result.get("execution_id")
+        execution = by_id.get(reference) if isinstance(reference, str) else None
+        if execution is not None and (
+            execution.node_id != node.node_id or execution.attempt != node.attempt
+        ):
+            execution = None
+        if execution is None:
+            matching = [
+                item
+                for item in executions
+                if item.node_id == node.node_id and item.attempt == node.attempt
+            ]
+            execution = matching[0] if len(matching) == 1 else None
+        result = {**node.result, "status": "cancelled", "error_code": "RUN_CANCELLED"}
+        if execution is not None:
+            result.update(execution_id=execution.id, result=execution.result)
+        node.status, node.result, node.revision = "cancelled", result, node.revision + 1
+        emit(
+            session,
+            run,
+            "node.status_changed",
+            {
+                "node_id": node.node_id,
+                "attempt": node.attempt,
+                "status": "cancelled",
+                "execution_id": execution.id if execution else None,
+            },
+        )
+
+
 def transition(
     session: Session,
     run: Run,
@@ -647,6 +691,8 @@ def transition(
                     "EVIDENCE_REQUIRED",
                     "Selected writing/review/commit attempts must succeed.",
                 )
+    if status == "cancelled":
+        cancel_nodes(session, run, executions)
     run.status = status
     if integration_status:
         run.integration_status = integration_status

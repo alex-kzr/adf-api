@@ -321,3 +321,192 @@ def test_pause_stops_dispatch_and_completion_requires_integration(
     assert (
         response.status_code == 409 and response.json()["code"] == "EVIDENCE_REQUIRED"
     )
+
+
+def test_final_cancel_closes_nodes_only_after_stopped_proof_and_replays_sse(
+    seeded: dict[str, Any],
+) -> None:
+    import json
+
+    client, run_id = seeded["client"], seeded["run"]["id"]
+    execution_id, lease = allocation(seeded)
+    internal = "/internal/runs/" + run_id
+    public = "/api/runs/" + run_id
+    client.post(
+        internal + "/transition", headers=seeded["orch"], json={"status": "running"}
+    )
+    prior = client.post(
+        internal + "/nodes",
+        headers=seeded["orch"],
+        json={
+            "node_id": "start",
+            "attempt": 1,
+            "status": "succeeded",
+            "result": {"status": "succeeded", "evidence": "prior-success"},
+        },
+    ).json()
+    dispatched = client.post(
+        internal + "/nodes",
+        headers=seeded["orch"],
+        json={
+            "node_id": "dev",
+            "attempt": 1,
+            "status": "dispatched",
+            "result": {"execution_id": execution_id, "retained": "dispatch-metadata"},
+        },
+    ).json()
+    prior_terminal = {}
+    for status in ["failed", "cancelled", "skipped"]:
+        node_id = "__prior_" + status
+        prior_terminal[node_id] = client.post(
+            internal + "/nodes",
+            headers=seeded["orch"],
+            json={
+                "node_id": node_id,
+                "attempt": 2,
+                "status": status,
+                "result": {"status": status, "preserved": "terminal-evidence"},
+            },
+        ).json()
+    # A waiting node without any execution must close without invented process evidence.
+    waiting = client.post(
+        internal + "/nodes",
+        headers=seeded["orch"],
+        json={
+            "node_id": "__waiting",
+            "attempt": 1,
+            "status": "waiting_approval",
+            "result": {"approval_id": "pending-reference"},
+        },
+    ).json()
+    worker_route = "/internal/executions/" + execution_id
+    identity = {
+        "pid": 123,
+        "start_ticks": 900,
+        "pgid": 123,
+        "session_id": 123,
+        "journal_id": "synthetic-supervisor",
+    }
+    assert (
+        client.post(
+            worker_route + "/heartbeat",
+            headers=seeded["worker"],
+            json={**lease, "process_identity": identity},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            public + "/cancel", headers={**seeded["admin"], "Idempotency-Key": "cancel"}
+        ).status_code
+        == 202
+    )
+    before = client.get(public, headers=seeded["admin"]).json()
+    rejected = client.post(
+        internal + "/transition", headers=seeded["orch"], json={"status": "cancelled"}
+    )
+    assert (
+        rejected.status_code == 409 and rejected.json()["code"] == "EXECUTIONS_ACTIVE"
+    )
+    after_rejection = client.get(public, headers=seeded["admin"]).json()
+    assert after_rejection["event_sequence"] == before["event_sequence"]
+    assert (
+        after_rejection["nodes"] == before["nodes"]
+        and after_rejection["status"] == "running"
+    )
+    unsafe_result = client.post(
+        worker_route + "/result",
+        headers=seeded["worker"],
+        json={**lease, "status": "cancelled", "result": {"process_stopped": False}},
+    )
+    assert unsafe_result.json()["code"] == "PROCESS_PROOF_REQUIRED"
+    proof = {
+        "process_stopped": True,
+        "error_code": "CANCEL_REQUESTED",
+        "commit_sha": "c" * 40,
+    }
+    assert (
+        client.post(
+            worker_route + "/result",
+            headers=seeded["worker"],
+            json={**lease, "status": "cancelled", "result": proof},
+        ).status_code
+        == 200
+    )
+    pre_final = client.get(public, headers=seeded["admin"]).json()
+    final = client.post(
+        internal + "/transition",
+        headers=seeded["orch"],
+        json={"status": "cancelled", "result": {"error_code": "CANCELLED"}},
+    )
+    assert final.status_code == 200, final.text
+    snapshot = client.get(public, headers=seeded["admin"]).json()
+    assert snapshot["status"] == "cancelled"
+    nodes = {item["node_id"]: item for item in snapshot["nodes"]}
+    assert nodes["start"] == prior
+    assert all(
+        nodes[node_id] == evidence for node_id, evidence in prior_terminal.items()
+    )
+    assert (
+        nodes["dev"]["status"] == "cancelled"
+        and nodes["dev"]["revision"] == dispatched["revision"] + 1
+    )
+    assert (
+        nodes["dev"]["result"]["execution_id"] == execution_id
+        and nodes["dev"]["result"]["result"] == proof
+    )
+    assert nodes["dev"]["result"]["retained"] == "dispatch-metadata"
+    assert (
+        nodes["__waiting"]["status"] == "cancelled"
+        and nodes["__waiting"]["revision"] == waiting["revision"] + 1
+    )
+    assert (
+        "process_stopped" not in nodes["__waiting"]["result"]
+        and "result" not in nodes["__waiting"]["result"]
+    )
+    assert not any(
+        item["status"] in {"dispatched", "running", "waiting_approval"}
+        for item in snapshot["nodes"]
+    )
+    events = client.get(
+        public + "/event-history",
+        headers=seeded["admin"],
+        params={"after": pre_final["event_sequence"]},
+    ).json()["items"]
+    assert [item["type"] for item in events] == [
+        "node.status_changed",
+        "node.status_changed",
+        "run.status_changed",
+    ]
+    assert all(item["payload"]["status"] == "cancelled" for item in events)
+    replay = client.post(
+        internal + "/transition",
+        headers=seeded["orch"],
+        json={"status": "cancelled", "result": {"error_code": "CANCELLED"}},
+    )
+    assert replay.status_code == 200
+    unchanged = client.get(public, headers=seeded["admin"]).json()
+    assert (
+        unchanged["event_sequence"] == snapshot["event_sequence"]
+        and unchanged["nodes"] == snapshot["nodes"]
+    )
+    sse = client.get(
+        public + "/events",
+        headers={**seeded["admin"], "Last-Event-ID": str(pre_final["event_sequence"])},
+    )
+    data = [
+        json.loads(line[6:])
+        for line in sse.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert [item["event_id"] for item in data] == [item["event_id"] for item in events]
+    assert (
+        data[-1]["type"] == "run.status_changed"
+        and data[-1]["payload"]["status"] == "cancelled"
+    )
+    terminal_rewrite = client.post(
+        internal + "/nodes",
+        headers=seeded["orch"],
+        json={"node_id": "dev", "attempt": 1, "status": "succeeded", "result": {}},
+    )
+    assert terminal_rewrite.json()["code"] == "NODE_TERMINAL"

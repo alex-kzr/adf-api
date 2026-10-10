@@ -364,3 +364,82 @@ def test_postgres_run_lock_refreshes_cancel_flag(pg: dict[str, Any]) -> None:
         assert result.status_code == 202
         current = lock_run(reader, stale.id)
         assert current.cancel_requested and current.revision > 1
+
+
+def test_postgres_final_cancel_atomically_closes_node_and_preserves_proof(
+    pg: dict[str, Any],
+) -> None:
+    data = seed(pg)
+    client, run_id = pg["client"], data["run"]["id"]
+    route = "/internal/runs/" + run_id
+    execution_id, worker_id = str(uuid4()), str(uuid4())
+    allocation = client.post(
+        route + "/executions",
+        headers=pg["orch"],
+        json={
+            "execution_id": execution_id,
+            "node_id": "__prepare",
+            "attempt": 1,
+            "operation": "repo_inspect",
+        },
+    )
+    assert allocation.status_code == 201
+    client.post(route + "/transition", headers=pg["orch"], json={"status": "running"})
+    node = client.post(
+        route + "/nodes",
+        headers=pg["orch"],
+        json={
+            "node_id": "__prepare",
+            "attempt": 1,
+            "status": "dispatched",
+            "result": {"execution_id": execution_id},
+        },
+    ).json()
+    client.post(
+        "/internal/workers/register",
+        headers=pg["worker"],
+        json={
+            "worker_id": worker_id,
+            "capabilities": {},
+            "allowed_roots": ["/home/adf/ai-factory"],
+        },
+    )
+    worker_route = "/internal/executions/" + execution_id
+    claim = client.post(
+        worker_route + "/claim", headers=pg["worker"], json={"worker_id": worker_id}
+    ).json()
+    client.post(
+        "/api/runs/" + run_id + "/cancel",
+        headers={**pg["admin"], "Idempotency-Key": "cancel-" + run_id},
+    )
+    rejected = client.post(
+        route + "/transition", headers=pg["orch"], json={"status": "cancelled"}
+    )
+    assert rejected.json()["code"] == "EXECUTIONS_ACTIVE"
+    unchanged = client.get(route, headers=pg["orch"]).json()
+    assert unchanged["nodes"] == [node]
+    proof = {"process_stopped": True, "error_code": "CANCEL_REQUESTED"}
+    completed = client.post(
+        worker_route + "/result",
+        headers=pg["worker"],
+        json={
+            "worker_id": worker_id,
+            "epoch": claim["epoch"],
+            "status": "cancelled",
+            "result": proof,
+        },
+    )
+    assert completed.status_code == 200
+    final = client.post(
+        route + "/transition", headers=pg["orch"], json={"status": "cancelled"}
+    ).json()
+    assert final["status"] == "cancelled" and final["nodes"][0]["status"] == "cancelled"
+    assert final["nodes"][0]["result"]["result"] == proof
+    assert final["nodes"][0]["revision"] == node["revision"] + 1
+    replay = client.post(
+        route + "/transition", headers=pg["orch"], json={"status": "cancelled"}
+    ).json()
+    assert (
+        replay["event_sequence"] == final["event_sequence"]
+        and replay["nodes"] == final["nodes"]
+    )
