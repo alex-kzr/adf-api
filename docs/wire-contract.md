@@ -10,7 +10,7 @@ GET lists return `{items,next_cursor}` with optional project_id/run_id/status fi
 - tasks: `{project_id,title,description,acceptance_criteria:[string],priority:0,status:"draft"|"ready",dependency_ids:[],expected_files:[]}`. Dependencies are same-project and acyclic. PATCH cannot manufacture running/done state.
 - agents: `{name,role,provider:"codex"|"claude"|"mock",model:null,prompt,skill_ids:[],tool_ids:[],mcp_server_ids:[],permission_profile:"observe"|"trusted-development",limits:{...}}`. Every edit creates an immutable config_version_id/config_hash.
 - workflows: `{name,graph_json:{schema_version:"1",nodes:[{id,type,config}],edges:[{id,source,target,source_port?,target_port?}]}}`; POST validate returns `{valid,errors}`; POST versions publishes validated immutable `{id,workflow_id,version,graph_json,graph_hash}`.
-- skills/tools/mcp-servers/policies: typed `{name,manifest}` definitions, immutable version/hash. No secret values or arbitrary shell strings. Skill manifest includes trusted path/version/hash; tools include input_schema/permission/provider_mappings; verified read mapping is {"claude":["Read","Glob","Grep"],"mock":[]}. Codex narrow mappings are unsupported. MCP includes transport:"stdio", argv, trusted:true, scope and allowed_tools.
+- skills/tools/mcp-servers/policies: typed `{name,manifest}` definitions, immutable version/hash. No secret values or arbitrary shell strings. Skill manifest includes trusted path/version/hash; tools include input_schema/permission/provider_mappings. Claude read mapping is {"claude":["Read","Glob","Grep"],"mock":[]}. Codex read mappings name exact assigned MCP tools, for example {"codex":["mcp__factoryfiles__read_marker"],"mock":[]}. Codex builtin/shell mappings are rejected. MCP includes transport:"stdio", argv, trusted:true, scope and allowed_tools.
 
 ## Public runtime
 
@@ -57,3 +57,28 @@ Event payloads are limited to 60,000 UTF-8 bytes so the complete SSE envelope/fr
 Metrics aggregate actual numeric provider input_tokens/output_tokens/cost, expose per-field known_count, and mark partial/unknown data rather than manufacturing zero cost. Public run `trace_url` is present only for configured loopback Langfuse and an actual persisted trace ID.
 
 Manual integration resolution permits one operator continuation at attempt 2 on the original integration node, including when `max_retries` is 0. The original attempt must be a failed, stopped `INTEGRATION_CONFLICT` with `integration_status:needs_resolution`. A same-run `integration_resolution` approval binds the current graph, plan, base, policy, permitted paths, original execution and exact resolution tree; it must be approved, unexpired, and explicitly resumed. Dispatch includes `manual_resolution:true`, `target_execution_id`, `resolution_tree_sha`, and optional `resolution_approval_id` matching that approval. The ledger derives `resolution_approved`; transport cannot grant it. Deadline, cancellation, concurrency, general plan approval and accepted commit-set guards still apply. This exception does not enlarge provider, test, or other automatic retry budgets. Node attempt 2 above the automatic quota can only project an existing server-authorized continuation in the same run and node.
+
+Scoped Codex MCP tool assignments use `permission:"read"` and an exact `mcp__<server>__<tool>` identifier. Components are case-sensitive ASCII names, start with a letter, contain at most 64 letters/digits/underscores/hyphens, and cannot contain `__`. Registry creation validates mapping format; agent creation/update, run pinning and dispatch additionally require the named server to be assigned and the tool to appear in its allowlist. Duplicate server names fail closed. MCP snapshots include the immutable config version's registry `name`, overridden only by an explicitly validated manifest `name`.
+
+A supported read-only server registration is:
+
+```json
+{
+  "name": "factoryfiles",
+  "manifest": {
+    "transport": "stdio",
+    "argv": ["python3", "-m", "adf_runtime_worker.scoped_mcp"],
+    "trusted": true,
+    "allowed_tools": ["read_marker"],
+    "scope": {
+      "contract": "adf.scoped-files.v1",
+      "root": "$WORKTREE",
+      "read_paths": ["marker.txt"],
+      "max_bytes": 4096
+    },
+    "timeout_sec": 2
+  }
+}
+```
+
+Assign its definition UUID in `mcp_server_ids` together with a tool definition whose manifest contains `input_schema`, `permission:"read"`, and `provider_mappings:{"codex":["mcp__factoryfiles__read_marker"]}`. The owned worker module supports `read_marker` and `read_file` only, using exact allocated-worktree paths; it independently enforces symlink and filesystem restrictions. `read_paths` contains 1–100 exact relative files without traversal, globs, credentials or agent configuration; case-insensitive components `.agents`, `.codex`, `.claude`, `.git`, `.ssh`, `.aws`, `.azure`, `.kube`, `.gnupg`, `.config` and private-key basenames `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519` are denied; `max_bytes` is a strict integer from 1–65536 (default 4096). Only the `python`/`python3 -m adf_runtime_worker.scoped_mcp` argv forms are registered, with no extra arguments, environment/auth maps or arbitrary server commands. Generic scope declarations cannot be assigned to Codex. `timeout_sec` remains bounded 1–1800 and the worker clamps it to the execution deadline. API validation of these declarations does not replace the worker's filesystem enforcement or live CLI acceptance gates.

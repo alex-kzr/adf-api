@@ -1,8 +1,10 @@
 """Typed, bounded public and internal request boundaries."""
 
-from typing import Any, Literal
+import re
+from pathlib import PurePosixPath
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Input(BaseModel):
@@ -83,10 +85,87 @@ class SkillManifest(Manifest):
     hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+def codex_tool_name(value: str) -> tuple[str, str] | None:
+    match = re.fullmatch(
+        r"mcp__([A-Za-z][A-Za-z0-9_-]{0,63})__([A-Za-z][A-Za-z0-9_-]{0,63})", value
+    )
+    if match is None or any("__" in component for component in match.groups()):
+        return None
+    return match[1], match[2]
+
+
 class ToolManifest(Manifest):
     input_schema: dict[str, Any]
     permission: Literal["read", "write", "check"]
-    provider_mappings: dict[Literal["claude", "mock"], list[str]]
+    provider_mappings: dict[Literal["codex", "claude", "mock"], list[str]]
+
+    @model_validator(mode="after")
+    def validate_mappings(self) -> Self:
+        for provider, names in self.provider_mappings.items():
+            if len(names) > 100 or len(names) != len(set(names)):
+                raise ValueError("Tool mappings must be bounded and unique.")
+            for name in names:
+                if provider == "codex":
+                    if codex_tool_name(name) is None:
+                        raise ValueError(
+                            "Codex mappings require exact MCP server/tool identifiers."
+                        )
+                elif not re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_]*(?:\([^\r\n]{1,200}\))?", name
+                ):
+                    raise ValueError("Provider tool mapping is invalid.")
+        if "codex" in self.provider_mappings and self.permission != "read":
+            raise ValueError("Codex MCP mappings require read permission.")
+        return self
+
+
+class ScopedFilesScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    contract: Literal["adf.scoped-files.v1"]
+    root: Literal["$WORKTREE"]
+    read_paths: list[
+        Annotated[str, Field(min_length=1, max_length=1024, strict=True)]
+    ] = Field(min_length=1, max_length=100)
+    max_bytes: int = Field(default=4096, ge=1, le=65536, strict=True)
+
+    @field_validator("read_paths")
+    @classmethod
+    def exact_read_paths(cls, paths: list[str]) -> list[str]:
+        denied = re.compile(
+            r"(?:^|/)(?:\.env(?:\..*)?|auth\.json|credentials[^/]*|[^/]*\.(?:pem|key)|node_modules|\.venv|__pycache__)(?:/|$)",
+            re.I,
+        )
+        denied_components = {
+            ".agents",
+            ".codex",
+            ".claude",
+            ".git",
+            ".ssh",
+            ".aws",
+            ".azure",
+            ".kube",
+            ".gnupg",
+            ".config",
+        }
+        denied_basenames = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+        if len(paths) != len(set(paths)):
+            raise ValueError("Scoped read paths must be unique.")
+        for value in paths:
+            path = PurePosixPath(value)
+            if (
+                path.is_absolute()
+                or not path.parts
+                or value != value.strip()
+                or str(path) != value
+                or ".." in path.parts
+                or any(part.lower() in denied_components for part in path.parts)
+                or path.name.lower() in denied_basenames
+                or any(character in value for character in "*?[\\:")
+                or any(ord(character) < 32 for character in value)
+                or denied.search(value)
+            ):
+                raise ValueError("Scoped MCP paths must be exact safe relative files.")
+        return paths
 
 
 class MCPManifest(Manifest):

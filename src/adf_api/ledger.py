@@ -10,7 +10,7 @@ from uuid import UUID, uuid5
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from .definitions import get, identifier, view
+from .definitions import get, identifier, registry_snapshots, view
 from .errors import DomainError
 from .evidence import full_sha, passing_checks, target_evidence
 from .models import (
@@ -32,6 +32,7 @@ from .models import (
 )
 from .privacy import canonical, digest, redact
 from .schemas import ExecutionInput, ExecutionRequest, Limits, RunInput
+from .tool_assignments import validate_tool_assignments
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
 RUN_TERMINAL = {"completed", "failed", "cancelled"}
@@ -237,20 +238,10 @@ def execution_view(execution: Execution, *, internal: bool = False) -> dict[str,
 
 
 def pin_agent(session: Session, snapshot: dict[str, Any]) -> dict[str, Any]:
-    registries: dict[str, list[dict[str, Any]]] = {}
-    for field in ["skill_ids", "tool_ids", "mcp_server_ids"]:
-        registries[field] = []
-        for definition_id in snapshot.get(field, []):
-            definition = get(session, Definition, definition_id)
-            config = get(session, ConfigVersion, definition.current_version_id)
-            registries[field].append(
-                {
-                    **config.data["manifest"],
-                    "id": definition.id,
-                    "version_id": config.id,
-                    "config_hash": config.config_hash,
-                }
-            )
+    registries = registry_snapshots(session, snapshot)
+    validate_tool_assignments(
+        snapshot["provider"], registries["tool_ids"], registries["mcp_server_ids"]
+    )
     return {**snapshot, "registry_snapshots": registries}
 
 
@@ -1041,6 +1032,12 @@ def create_execution(session: Session, run: Run, data: ExecutionInput) -> Execut
             "No pinned agent configuration exists for this operation.",
             422,
         )
+    pinned_registries = agent.get("registry_snapshots", {})
+    validate_tool_assignments(
+        agent.get("provider", "none"),
+        pinned_registries.get("tool_ids", []),
+        pinned_registries.get("mcp_server_ids", []),
+    )
     provider = agent.get("provider")
     if (
         limits.get("provider_pin")

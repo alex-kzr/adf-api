@@ -38,6 +38,7 @@ from .schemas import (
     ToolManifest,
     WorkflowInput,
 )
+from .tool_assignments import scoped_server, validate_tool_assignments
 
 
 class Validator(Protocol):
@@ -239,23 +240,45 @@ def task_data(
     return data
 
 
+def registry_snapshots(
+    session: Session, snapshot: dict[str, Any]
+) -> dict[str, list[dict[str, Any]]]:
+    registries: dict[str, list[dict[str, Any]]] = {}
+    for field, kind in [
+        ("skill_ids", "skills"),
+        ("tool_ids", "tools"),
+        ("mcp_server_ids", "mcp-servers"),
+    ]:
+        registries[field] = []
+        for definition_id in snapshot.get(field, []):
+            definition = get(session, Definition, identifier(definition_id))
+            if definition.kind != kind:
+                raise DomainError(
+                    "INVALID_REFERENCE",
+                    "Agent registry references have the wrong type.",
+                    422,
+                )
+            config = get(session, ConfigVersion, definition.current_version_id)
+            registries[field].append(
+                {
+                    "name": config.data["name"],
+                    **config.data["manifest"],
+                    "id": definition.id,
+                    "version_id": config.id,
+                    "config_hash": config.config_hash,
+                }
+            )
+    return registries
+
+
 def registry_data(kind: str, value: dict[str, Any], session: Session) -> dict[str, Any]:
     reject_credentials(value)
     if kind == "agents":
         data = AgentInput.model_validate(value).model_dump()
-        for field, target in [
-            ("skill_ids", "skills"),
-            ("tool_ids", "tools"),
-            ("mcp_server_ids", "mcp-servers"),
-        ]:
-            for item in data[field]:
-                definition = get(session, Definition, identifier(item))
-                if definition.kind != target:
-                    raise DomainError(
-                        "INVALID_REFERENCE",
-                        "Agent registry references have the wrong type.",
-                        422,
-                    )
+        registries = registry_snapshots(session, data)
+        validate_tool_assignments(
+            data["provider"], registries["tool_ids"], registries["mcp_server_ids"]
+        )
         return data
     if kind == "workflows":
         return WorkflowInput.model_validate(value).model_dump()
@@ -341,6 +364,8 @@ def registry_data(kind: str, value: dict[str, Any], session: Session) -> dict[st
                 "Only local allowlisted stdio MCP servers are supported.",
                 422,
             )
+        if manifest.get("scope", {}).get("contract") == "adf.scoped-files.v1":
+            scoped_server({"name": data["name"], **manifest})
     elif kind == "tools":
         if not isinstance(manifest.get("input_schema"), dict) or manifest.get(
             "permission"
@@ -348,27 +373,6 @@ def registry_data(kind: str, value: dict[str, Any], session: Session) -> dict[st
             raise DomainError(
                 "INVALID_MANIFEST",
                 "Tools require an input JSON Schema and scoped permission.",
-                422,
-            )
-        mappings = manifest.get("provider_mappings")
-        if (
-            not isinstance(mappings, dict)
-            or set(mappings) - {"claude", "mock"}
-            or any(
-                not isinstance(names, list)
-                or any(
-                    not isinstance(name, str)
-                    or not re.fullmatch(
-                        r"[A-Za-z][A-Za-z0-9_]*(?:\([^\r\n]{1,200}\))?", name
-                    )
-                    for name in names
-                )
-                for names in mappings.values()
-            )
-        ):
-            raise DomainError(
-                "INVALID_MANIFEST",
-                "Tools require explicit supported provider_mappings; Codex has no verified narrow tool mapping.",
                 422,
             )
     return data

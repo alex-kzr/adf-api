@@ -44,7 +44,7 @@ def conflict_setup(seeded: dict[str, Any], *, resume: bool = True) -> dict[str, 
     assert policy.status_code == 201, policy.text
     response = client.post(
         "/api/runs",
-        headers={**admin, "Idempotency-Key": "resolution-run"},
+        headers={**admin, "Idempotency-Key": "resolution-run-" + str(uuid4())},
         json={
             **seeded["run_body"],
             "task_id": seeded["task"]["id"],
