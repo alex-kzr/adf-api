@@ -1,13 +1,13 @@
-import unittest
-import httpx
+"""Diagnostics report actual migration configuration, separately from runtime readiness."""
+
+from fastapi.testclient import TestClient
+
 from adf_api.main import app
 
-class DiagnosticContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_alive_but_not_ready(self) -> None:
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            self.assertEqual((await client.get("/healthz")).status_code, 200)
-            result = await client.get("/readyz")
-            self.assertEqual(result.status_code, 503)
-            self.assertEqual(result.json()["code"], "SCAFFOLD_NOT_IMPLEMENTED")
-            self.assertEqual((await client.post("/api/runs", json={})).status_code, 404)
+
+def test_alive_without_migrations_is_not_ready() -> None:
+    with TestClient(app) as client:
+        assert client.get("/healthz").status_code == 200
+        result = client.get("/readyz")
+        assert result.status_code == 503
+        assert result.json()["runtime_ready"] is False

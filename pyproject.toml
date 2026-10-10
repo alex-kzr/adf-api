@@ -4,13 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "adf-api"
-version = "0.0.1"
-description = "ADF diagnostic foundation scaffold"
+version = "0.1.0"
+description = "ADF authenticated durable control plane"
 requires-python = ">=3.12"
-dependencies = ["fastapi==0.143.0", "uvicorn==0.54.0"]
+dependencies = ["fastapi==0.143.0", "uvicorn==0.54.0", "SQLAlchemy==2.0.54", "alembic==1.20.0", "psycopg[binary]==3.3.6", "httpx==0.28.1", "opentelemetry-sdk==1.45.1", "opentelemetry-exporter-otlp-proto-http==1.45.1"]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1", "mypy==2.4.0", "ruff==0.17.0"]
+
+[tool.setuptools.package-data]
+adf_api = ["migrations/**/*.py"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.mypy]
 strict = true
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "S", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/adf_api/models.py" = ["RUF012"] # SQLAlchemy manages class-level table metadata.
+"tests/*.py" = ["S101", "S105", "S106"] # Assertions and synthetic authentication fixtures.

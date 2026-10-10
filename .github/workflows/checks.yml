@@ -1,0 +1,41 @@
+name: API checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.0@sha256:41fc5342eefba6cc2ccda736aaf034bbbb7c3df0fdb81516eba1ba33f360162c
+        env:
+          POSTGRES_PASSWORD: isolated-ci-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements.lock && python -m pip install --no-deps -e .
+      - run: ruff check src tests && ruff format --check src tests && mypy src
+      - run: python tests/prepare_ci_database.py
+        env:
+          ADF_CI_POSTGRES_URL: postgresql://postgres:isolated-ci-test-password@localhost:5432/postgres
+      - run: python -m adf_api.migrate
+        env:
+          DATABASE_URL: postgresql+psycopg://adf_migrator@localhost:5432/adf_api_test
+          ADF_DB_PASSWORD_FILE: ${{ env.ADF_CI_MIGRATOR_PASSWORD_FILE }}
+      - run: pytest -q
+        env:
+          DATABASE_URL: postgresql+psycopg://adf_api@localhost:5432/adf_api_test
+          ADF_TEST_DATABASE_URL: postgresql+psycopg://adf_api@localhost:5432/adf_api_test
+          ADF_DB_PASSWORD_FILE: ${{ env.ADF_CI_API_PASSWORD_FILE }}
