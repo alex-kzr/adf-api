@@ -10,7 +10,16 @@ from .config import Settings
 from .db import Database
 from .definitions import get, identifier, view
 from .errors import DomainError
-from .ledger import clock, emit, idempotent, instant, lock_run, run_view
+from .ledger import (
+    clock,
+    conflicted_integration,
+    emit,
+    idempotent,
+    instant,
+    lock_run,
+    resolution_bindings,
+    run_view,
+)
 from .models import Approval, Command, Execution, uid
 from .plans import save_plan
 from .privacy import digest
@@ -69,8 +78,7 @@ def build_router(database: Database, settings: Settings) -> APIRouter:
                 )
                 tree_sha = body.get("tree_sha", "")
                 if (
-                    execution.run_id != run.id
-                    or execution.operation != "integrate"
+                    not conflicted_integration(execution, run)
                     or not isinstance(tree_sha, str)
                     or not re.fullmatch("[0-9a-f]{40}", tree_sha)
                 ):
@@ -79,20 +87,7 @@ def build_router(database: Database, settings: Settings) -> APIRouter:
                         "Resolution must bind the conflicted integration execution and exact Git tree.",
                         422,
                     )
-                snapshot = {
-                    "graph_hash": run.snapshot.get("graph_hash"),
-                    "plan_hash": run.snapshot.get("plan_hash"),
-                    "root_base_sha": run.snapshot.get("root_base_sha"),
-                    "policy_hash": run.snapshot["policy"].get(
-                        "config_hash", digest(run.snapshot["policy"])
-                    ),
-                    "execution_id": execution.id,
-                    "tree_sha": tree_sha,
-                    "allowed_write_paths": run.snapshot["policy"].get(
-                        "allowed_write_paths", []
-                    ),
-                    "action": "integration_resolution",
-                }
+                snapshot = resolution_bindings(run, execution.id, tree_sha)
                 approval = Approval(
                     id=uid(),
                     run_id=run.id,

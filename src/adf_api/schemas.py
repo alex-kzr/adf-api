@@ -149,6 +149,7 @@ class ExecutionRequest(BaseModel):
     max_steps: int = Field(default=100, ge=1, le=1000, strict=True)
     manual_resolution: bool = Field(default=False, strict=True)
     resolution_tree_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
+    resolution_approval_id: str | None = Field(default=None, max_length=36)
 
 
 class ExecutionInput(Input):

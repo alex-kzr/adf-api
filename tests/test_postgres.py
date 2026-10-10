@@ -443,3 +443,70 @@ def test_postgres_final_cancel_atomically_closes_node_and_preserves_proof(
         replay["event_sequence"] == final["event_sequence"]
         and replay["nodes"] == final["nodes"]
     )
+
+
+def test_postgres_manual_continuation_is_one_durable_allocation(
+    pg: dict[str, Any],
+) -> None:
+    from threading import Barrier
+
+    from test_manual_resolution import conflict_setup
+
+    from adf_api.models import Event, Outbox
+
+    data = seed(pg)
+    case = conflict_setup(
+        {**pg, **data, "run_body": {**data["body"], "root_base_sha": "a" * 40}}
+    )
+    pg["owned"].append(case["run_id"])
+    barrier = Barrier(2, timeout=10)
+
+    def invoke(_index: int):
+        barrier.wait()
+        return pg["client"].post(
+            case["route"] + "/executions",
+            headers=pg["orch"],
+            json={**case["body"], "execution_id": str(uuid4())},
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(invoke, range(2)))
+    assert sorted(response.status_code for response in responses) == [201, 409], [
+        response.text for response in responses
+    ]
+    winner = next(
+        response.json() for response in responses if response.status_code == 201
+    )
+    assert winner["request"]["policy"]["max_retries"] == 0
+    assert winner["request"]["resolution_approved"] is True
+    with pg["db"].transaction() as session:
+        continuations = list(
+            session.scalars(
+                select(Execution).where(
+                    Execution.run_id == case["run_id"], Execution.attempt == 2
+                )
+            )
+        )
+        assert [execution.id for execution in continuations] == [winner["id"]]
+        assert (
+            len(
+                list(
+                    session.scalars(
+                        select(Outbox).where(Outbox.execution_id == winner["id"])
+                    )
+                )
+            )
+            == 1
+        )
+        events = list(
+            session.scalars(
+                select(Event).where(
+                    Event.run_id == case["run_id"], Event.type == "execution.created"
+                )
+            )
+        )
+        assert sum(event.payload.get("attempt") == 2 for event in events) == 1
+        original = session.get(Execution, case["original_id"])
+        assert (
+            original.status == "failed" and original.result["process_stopped"] is True
+        )

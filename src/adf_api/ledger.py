@@ -782,6 +782,109 @@ def approved(session: Session, run: Run) -> bool:
     return False
 
 
+def resolution_bindings(run: Run, execution_id: str, tree_sha: str) -> dict[str, Any]:
+    """Bind operator permission to one conflicted allocation and exact resolved tree."""
+    return {
+        "graph_hash": run.snapshot.get("graph_hash"),
+        "plan_hash": run.snapshot.get("plan_hash"),
+        "root_base_sha": run.snapshot.get("root_base_sha"),
+        "policy_hash": run.snapshot["policy"].get(
+            "config_hash", digest(run.snapshot["policy"])
+        ),
+        "execution_id": execution_id,
+        "tree_sha": tree_sha,
+        "allowed_write_paths": run.snapshot["policy"].get("allowed_write_paths", []),
+        "action": "integration_resolution",
+    }
+
+
+def conflicted_integration(execution: Execution, run: Run) -> bool:
+    return (
+        execution.run_id == run.id
+        and execution.operation == "integrate"
+        and execution.attempt == 1
+        and execution.status == "failed"
+        and execution.result.get("error_code") == "INTEGRATION_CONFLICT"
+        and execution.result.get("integration_status") == "needs_resolution"
+        and execution.result.get("process_stopped") is True
+    )
+
+
+def authorize_manual_continuation(
+    session: Session, run: Run, data: ExecutionInput, request: dict[str, Any]
+) -> None:
+    """One operator continuation does not consume or enlarge automatic retry budgets."""
+    resolution = run.snapshot.get("resolution", {})
+    original = (
+        session.get(Execution, resolution.get("execution_id")) if resolution else None
+    )
+    approval = (
+        session.get(Approval, resolution.get("approval_id"))
+        if resolution.get("approval_id")
+        else None
+    )
+    expected = resolution_bindings(
+        run, resolution.get("execution_id", ""), resolution.get("tree_sha", "")
+    )
+    if (
+        data.operation != "integrate"
+        or data.attempt != 2
+        or run.integration_status != "needs_resolution"
+        or run.snapshot.get("resolution_resume_requested") is not True
+        or original is None
+        or not conflicted_integration(original, run)
+        or original.node_id != data.node_id
+        or original.request.get("task_id") != (data.task_id or run.task_id)
+        or request.get("target_execution_id") != original.id
+        or not full_sha(resolution.get("tree_sha"))
+        or request.get("resolution_tree_sha") != resolution.get("tree_sha")
+        or (
+            "execution_base_sha" in request
+            and request["execution_base_sha"]
+            != original.request.get("execution_base_sha")
+        )
+        or approval is None
+        or approval.run_id != run.id
+        or approval.action != "integration_resolution"
+        or approval.decision != "approve"
+        or instant(approval.expires_at) <= clock(session)
+        or approval.snapshot_hash != digest(approval.snapshot)
+        or approval.snapshot != expected
+        or (
+            "resolution_approval_id" in request
+            and request["resolution_approval_id"] != approval.id
+        )
+    ):
+        raise DomainError(
+            "RESOLUTION_APPROVAL_REQUIRED",
+            "Continuation requires the stopped conflict, exact approved tree, and explicit resume.",
+            403,
+        )
+
+
+def recorded_manual_continuation(
+    session: Session, run: Run, node_id: str, attempt: int
+) -> Execution | None:
+    """Projection permission comes from an already authorized durable execution."""
+    if attempt != 2:
+        return None
+    execution = session.scalar(
+        select(Execution).where(
+            Execution.run_id == run.id,
+            Execution.node_id == node_id,
+            Execution.attempt == attempt,
+            Execution.operation == "integrate",
+        )
+    )
+    if (
+        execution is not None
+        and execution.request.get("manual_resolution") is True
+        and execution.request.get("resolution_approved") is True
+    ):
+        return execution
+    return None
+
+
 def create_execution(session: Session, run: Run, data: ExecutionInput) -> Execution:
     execution_id = identifier(data.execution_id)
     raw_hash = digest(data.model_dump())
@@ -801,9 +904,24 @@ def create_execution(session: Session, run: Run, data: ExecutionInput) -> Execut
         raise DomainError("CONTROL_PENDING", "Run controls prevent dispatch.")
     if clock(session) >= instant(run.snapshot["deadline_at"]):
         raise DomainError("RUN_TIMEOUT", "Run deadline reached; request cancellation.")
+    request = ExecutionRequest.model_validate(data.request).model_dump(
+        exclude_unset=True
+    )
+    request.pop(
+        "resolution_approved", None
+    )  # Only the ledger can stamp operator permission.
+    manual_continuation = (
+        data.operation == "integrate" and request.get("manual_resolution") is True
+    )
+    if manual_continuation:
+        authorize_manual_continuation(session, run, data, request)
     limits = run.snapshot["policy"]
-    if data.attempt > limits["max_retries"] + 1:
+    if data.attempt > limits["max_retries"] + 1 and not manual_continuation:
         raise DomainError("QUOTA_EXCEEDED", "Maximum attempts exceeded.")
+    if request.get("manual_resolution") is True and not manual_continuation:
+        raise DomainError(
+            "INVALID_REQUEST", "Operator resolution is restricted to integration.", 422
+        )
     if session.bind is not None and session.bind.dialect.name == "postgresql":
         session.execute(text("SELECT pg_advisory_xact_lock(184739013)"))
     active = list(
@@ -991,9 +1109,6 @@ def create_execution(session: Session, run: Run, data: ExecutionInput) -> Execut
         raise DomainError(
             "UNTRUSTED_REPOSITORY", "Writes require an explicitly trusted project.", 403
         )
-    request = ExecutionRequest.model_validate(data.request).model_dump(
-        exclude_unset=True
-    )
     if (
         "workspace_path" in request
         or "cwd" in request
@@ -1110,26 +1225,7 @@ def create_execution(session: Session, run: Run, data: ExecutionInput) -> Execut
                 "Integration accepts only unique approved task commits from this run.",
                 403,
             )
-        if request.get("manual_resolution"):
-            resolution = run.snapshot.get("resolution", {})
-            approval = (
-                session.get(Approval, resolution.get("approval_id"))
-                if resolution.get("approval_id")
-                else None
-            )
-            if (
-                approval is None
-                or approval.decision != "approve"
-                or instant(approval.expires_at) <= clock(session)
-                or request.get("target_execution_id") != resolution.get("execution_id")
-                or request.get("resolution_tree_sha") != resolution.get("tree_sha")
-                or not run.snapshot.get("resolution_resume_requested")
-            ):
-                raise DomainError(
-                    "RESOLUTION_APPROVAL_REQUIRED",
-                    "Manual resolution requires the exact approved tree and explicit resume.",
-                    403,
-                )
+        if manual_continuation:
             request["resolution_approved"] = True
     agent_limits = agent.get("limits", {})
     request.update(

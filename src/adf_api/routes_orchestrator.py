@@ -21,6 +21,7 @@ from .ledger import (
     instant,
     lock_run,
     matches_approval,
+    recorded_manual_continuation,
     run_view,
     transition,
 )
@@ -183,7 +184,14 @@ def build_router(database: Database, settings: Settings) -> APIRouter:
                     "INVALID_NODE", "Node is not part of the pinned workflow.", 422
                 )
             if body.attempt > run.snapshot["policy"]["max_retries"] + 1:
-                raise DomainError("QUOTA_EXCEEDED", "Node attempt budget exceeded.")
+                continuation = recorded_manual_continuation(
+                    session, run, body.node_id, body.attempt
+                )
+                if continuation is None or (
+                    body.result.get("execution_id") is not None
+                    and body.result["execution_id"] != continuation.id
+                ):
+                    raise DomainError("QUOTA_EXCEEDED", "Node attempt budget exceeded.")
             row = session.scalar(
                 select(Node).where(
                     Node.run_id == run.id,
