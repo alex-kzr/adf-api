@@ -556,3 +556,135 @@ def test_manifest_permissions_are_typed_not_truthy(harness: dict[str, Any]) -> N
         },
     )
     assert response.status_code == 422
+
+
+def test_manual_graph_child_scope_survives_test_dispatch_without_plan(
+    seeded: dict[str, Any],
+) -> None:
+    client, admin = seeded["client"], seeded["admin"]
+    root = client.post(
+        "/api/tasks",
+        headers=admin,
+        json={
+            "project_id": seeded["project"]["id"],
+            "title": "Manual parallel root",
+            "expected_files": ["src/root.py"],
+            "status": "ready",
+        },
+    ).json()
+    child_paths = ["src/child.py", "src/test_child.py"]
+    child = client.post(
+        "/api/tasks",
+        headers=admin,
+        json={
+            "project_id": seeded["project"]["id"],
+            "parent_id": root["id"],
+            "title": "Manual child",
+            "expected_files": child_paths,
+            "status": "ready",
+        },
+    ).json()
+    graph = {
+        "nodes": [
+            {"id": "start", "type": "start", "config": {}},
+            {
+                "id": "child_agent",
+                "type": "agent_task",
+                "config": {"task_id": child["id"], "expected_files": child_paths},
+            },
+            {
+                "id": "child_test",
+                "type": "test",
+                "config": {"target_node": "child_agent", "check_ids": ["unit"]},
+            },
+            {"id": "end", "type": "end", "config": {}},
+        ],
+        "edges": [
+            {"source": "start", "target": "child_agent"},
+            {"source": "child_agent", "target": "child_test"},
+            {"source": "child_test", "target": "end"},
+        ],
+    }
+    workflow = client.post(
+        "/api/workflows",
+        headers=admin,
+        json={"name": "Manual child wire", "graph_json": graph},
+    ).json()
+    version = client.post(
+        "/api/workflows/" + workflow["id"] + "/versions", headers=admin
+    ).json()
+    response = client.post(
+        "/api/runs",
+        headers={**admin, "Idempotency-Key": "manual-child-run"},
+        json={
+            **seeded["run_body"],
+            "task_id": root["id"],
+            "workflow_version_id": version["id"],
+        },
+    )
+    assert response.status_code == 201, response.text
+    seeded["run"] = response.json()
+    assert seeded["run"]["plan"] is None
+    approval = approve(seeded)
+    assert approval["snapshot"]["allowed_write_paths"] == sorted(
+        ["src/root.py", *child_paths]
+    )
+    agent = dispatch(
+        seeded,
+        task_id=child["id"],
+        node_id="child_agent",
+        request={"allowed_write_paths": child_paths},
+    )
+    assert agent.status_code == 201, agent.text
+    execution_id = agent.json()["id"]
+    registration = client.post(
+        "/internal/workers/register",
+        headers=seeded["worker"],
+        json={
+            "worker_id": "manual-child-worker",
+            "capabilities": {"mock": {"ready": True}},
+            "allowed_roots": ["/home/adf/ai-factory"],
+        },
+    )
+    assert registration.status_code == 200
+    claim = client.post(
+        "/internal/executions/" + execution_id + "/claim",
+        headers=seeded["worker"],
+        json={"worker_id": "manual-child-worker"},
+    ).json()
+    result = client.post(
+        "/internal/executions/" + execution_id + "/result",
+        headers=seeded["worker"],
+        json={
+            "worker_id": "manual-child-worker",
+            "epoch": claim["epoch"],
+            "status": "succeeded",
+            "result": {"tree_sha": "b" * 40, "process_stopped": True},
+        },
+    )
+    assert result.status_code == 200
+    request = {
+        "target_execution_id": execution_id,
+        "tree_sha": "b" * 40,
+        "allowed_write_paths": child_paths,
+        "check_ids": ["unit"],
+    }
+    test = dispatch(
+        seeded,
+        operation="test",
+        task_id=child["id"],
+        node_id="child_test",
+        dependency_execution_ids=[execution_id],
+        request=request,
+    )
+    assert test.status_code == 201, test.text
+    assert test.json()["request"]["task_id"] == child["id"]
+    assert test.json()["request"]["allowed_write_paths"] == child_paths
+    widened = dispatch(
+        seeded,
+        operation="test",
+        task_id=child["id"],
+        node_id="another_test",
+        request={**request, "allowed_write_paths": ["src/root.py", *child_paths]},
+    )
+    assert widened.status_code == 403 and widened.json()["code"] == "WRITE_SCOPE_DENIED"
