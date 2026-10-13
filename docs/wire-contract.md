@@ -82,3 +82,13 @@ A supported read-only server registration is:
 ```
 
 Assign its definition UUID in `mcp_server_ids` together with a tool definition whose manifest contains `input_schema`, `permission:"read"`, and `provider_mappings:{"codex":["mcp__factoryfiles__read_marker"]}`. The owned worker module supports `read_marker` and `read_file` only, using exact allocated-worktree paths; it independently enforces symlink and filesystem restrictions. `read_paths` contains 1–100 exact relative files without traversal, globs, credentials or agent configuration; case-insensitive components `.agents`, `.codex`, `.claude`, `.git`, `.ssh`, `.aws`, `.azure`, `.kube`, `.gnupg`, `.config` and private-key basenames `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519` are denied; `max_bytes` is a strict integer from 1–65536 (default 4096). Only the `python`/`python3 -m adf_runtime_worker.scoped_mcp` argv forms are registered, with no extra arguments, environment/auth maps or arbitrary server commands. Generic scope declarations cannot be assigned to Codex. `timeout_sec` remains bounded 1–1800 and the worker clamps it to the execution deadline. API validation of these declarations does not replace the worker's filesystem enforcement or live CLI acceptance gates.
+
+## Selected capability provenance
+
+The existing orchestrator-only `GET /internal/executions/{id}` includes
+`capability_audit`: execution/run/lease epoch, resulting tree hash, a truncation
+flag and at most 128 selected metadata events. Only approved skill hashes and
+completed allowlisted MCP calls are projected. Raw tool/provider output, skill
+content, unknown fields, stale epochs and unassigned capabilities are excluded.
+This proves trusted-worker materialization/reported calls, not semantic model
+consumption. Endpoint credentials, permissions and database schema are unchanged.

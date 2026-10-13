@@ -237,6 +237,84 @@ def execution_view(execution: Execution, *, internal: bool = False) -> dict[str,
     return result
 
 
+def capability_audit(session: Session, execution: Execution) -> dict[str, Any]:
+    """Project selected lease-bound metadata, never raw provider/tool payloads."""
+    agent = execution.request.get("agent", {})
+    hashes = {
+        item.get("manifest", item).get("sha256", item.get("manifest", item).get("hash"))
+        for item in agent.get("skills", [])
+    }
+    servers = {
+        item.get("manifest", item).get("name", item.get("name")): set(
+            item.get("manifest", item).get("allowed_tools", [])
+        )
+        for item in agent.get("mcp_servers", [])
+    }
+    rows = list(
+        session.scalars(
+            select(Event)
+            .where(
+                Event.execution_id == execution.id,
+                Event.run_id == execution.run_id,
+                Event.epoch == execution.epoch,
+                Event.type.in_(["skill_loaded", "tool_finished"]),
+            )
+            .order_by(Event.sequence)
+            .limit(129)
+        )
+    )
+    evidence = []
+    for event in rows[:128]:
+        payload = event.payload
+        fields: dict[str, Any] = {}
+        if event.type == "skill_loaded":
+            sha, name = payload.get("sha256"), payload.get("name")
+            if (
+                isinstance(sha, str)
+                and re.fullmatch(r"[0-9a-f]{64}", sha)
+                and sha in hashes
+                and isinstance(name, str)
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name)
+                and type(payload.get("native")) is bool
+            ):
+                fields = {
+                    "kind": "skill_loaded",
+                    "name": name,
+                    "sha256": sha,
+                    "native": payload["native"],
+                }
+        elif (
+            payload.get("tool_id") == "mcp_tool_call"
+            and payload.get("status") == "completed"
+        ):
+            server, tool = payload.get("server_id"), payload.get("tool_name")
+            if (
+                isinstance(server, str)
+                and isinstance(tool, str)
+                and tool in servers.get(server, set())
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", server)
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", tool)
+            ):
+                fields = {
+                    "kind": "mcp_tool_call",
+                    "server_id": server,
+                    "tool_name": tool,
+                    "status": "completed",
+                }
+        if fields:
+            evidence.append(
+                {"event_id": event.id, "sequence": event.sequence, **fields}
+            )
+    return {
+        "execution_id": execution.id,
+        "run_id": execution.run_id,
+        "epoch": execution.epoch,
+        "tree_sha": execution.result.get("tree_sha"),
+        "truncated": len(rows) > 128,
+        "events": evidence,
+    }
+
+
 def pin_agent(session: Session, snapshot: dict[str, Any]) -> dict[str, Any]:
     registries = registry_snapshots(session, snapshot)
     validate_tool_assignments(

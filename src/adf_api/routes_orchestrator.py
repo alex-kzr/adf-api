@@ -13,6 +13,7 @@ from .errors import DomainError
 from .ledger import (
     ACTIVE,
     RUN_TERMINAL,
+    capability_audit,
     clock,
     control,
     create_execution,
@@ -246,9 +247,11 @@ def build_router(database: Database, settings: Settings) -> APIRouter:
     @router.get("/executions/{execution_id}")
     def execution(execution_id: str) -> dict[str, Any]:
         with database.transaction() as session:
-            return execution_view(
-                get(session, Execution, identifier(execution_id)), internal=True
-            )
+            row = get(session, Execution, identifier(execution_id))
+            return {
+                **execution_view(row, internal=True),
+                "capability_audit": capability_audit(session, row),
+            }
 
     @router.post("/runs/{run_id}/approvals", status_code=201)
     def approval_request(run_id: str, body: ApprovalInput) -> dict[str, Any]:
